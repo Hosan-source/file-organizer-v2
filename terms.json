@@ -1,0 +1,12 @@
+{
+  "terms": [
+    "AI", "API", "AWS", "CSS", "DB", "DNS", "GPU", "HTML", "HTTP", "HTTPS",
+    "ID", "IoT", "IP", "IT", "JS", "JSON", "JWT", "LLM", "ML", "NLP",
+    "NPM", "OS", "PDF", "PHP", "REST", "SDK", "SQL", "SSH", "SSL", "TCP",
+    "UI", "URL", "USB", "UX", "VPN", "XML",
+    "AutoCAD", "GitHub", "GitHub", "JavaScript", "LinkedIn", "MySQL",
+    "Node.js", "NoSQL", "PostgreSQL", "PowerShell", "PyCharm",
+    "Python", "React", "TypeScript", "VSCode", "YouTube", "WordPress",
+    "iPhone", "iPad", "macOS", "iOS", "Android", "Windows", "Linux"
+  ]
+}
