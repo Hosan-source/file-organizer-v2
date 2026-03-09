@@ -1,9 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 ========================================
-파일정리 프로그램 v2.0 - Engine
+파일정리 프로그램 v2.1 - Engine
 비즈니스 로직 (파일 조작, 해시, 분류)
 ========================================
+v2.0 → v2.1 수정사항:
+  #1  삭제 시 권한부족 → 읽기전용 해제 + 재시도
+  #2  선택삭제 전체삭제 → delete_set → file_actions dict 방식 (GUI측)
+  #3  검색기록 저장 → search_history.json 자동 저장
+  #5  진행률 % → 콜백에 퍼센트 포함
+  #6  유틸 이동실패 → shutil.move 권한 오류 시 copy+delete fallback
+  #7  확장자 분류 오류 → 동일 fallback 적용
+  #9  파일명 변환 → CJK 혼합 처리 개선, 빈 결과 방지
+  #10 중복 폴더 미제거 → _remove_empty_dirs 다중패스 + 시스템파일 무시
+  #11 작업속도 → 진행률 업데이트 빈도 감소
 """
 import os
 import sys
@@ -11,6 +21,7 @@ import json
 import hashlib
 import shutil
 import re
+import stat
 import subprocess
 import logging
 from datetime import datetime
@@ -33,8 +44,7 @@ def resource_path(relative_path: str) -> str:
 
 
 def writable_path(relative_path: str) -> str:
-    """쓰기 가능한 경로: exe 옆(frozen) 또는 스크립트 디렉토리
-    [A2] terms.json 저장 경로 버그 수정"""
+    """쓰기 가능한 경로: exe 옆(frozen) 또는 스크립트 디렉토리"""
     if getattr(sys, 'frozen', False):
         base = os.path.dirname(sys.executable)
     else:
@@ -53,10 +63,7 @@ CODE_EXTENSIONS = {
     '.bat', '.cmd', '.vbs', '.ps1', '.m',
 }
 
-# 프로젝트 감지에만 사용 (개별 파일은 확장자별 분류로)
 WEB_CONTENT_EXTENSIONS = {'.html', '.css', '.scss', '.sass', '.less'}
-
-# 프로젝트 감지용: 코드 + 웹 콘텐츠 통합
 PROJECT_CODE_EXTENSIONS = CODE_EXTENSIONS | WEB_CONTENT_EXTENSIONS
 
 PROJECT_MARKERS = {
@@ -80,6 +87,9 @@ DOCUMENT_EXTENSIONS = {
 
 EXCLUDED_FOLDERS = {'Util', '기타', '_Log'}
 
+# [#10] 빈 폴더 판정 시 무시할 시스템 파일 (클래스 밖 상수)
+_SYSTEM_JUNK_FILES = frozenset({'.DS_Store', 'Thumbs.db', 'desktop.ini', '._.DS_Store'})
+
 # 크로스플랫폼 기본 경로
 if sys.platform == 'win32':
     DEFAULT_BASE = 'E:\\'
@@ -88,10 +98,8 @@ elif sys.platform == 'darwin':
 else:
     DEFAULT_BASE = os.path.expanduser('~/Downloads')
 
-# [C6] 부분 해시 크기 64KB로 증가
 HASH_CHUNK_SIZE = 65536
 
-# [보안] Windows 파일명 금지 문자 + 예약어
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL',
                       'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
@@ -100,31 +108,23 @@ _WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL',
 
 def sanitize_name(name: str) -> str:
     """파일명/폴더명에서 금지 문자 제거 + path traversal 방지"""
-    # path traversal 방지
     name = os.path.basename(name)
     name = name.replace('..', '_')
-    # 금지 문자 제거
     name = _INVALID_FILENAME_CHARS.sub('_', name)
-    # Windows 예약어 방지
     base = name.split('.')[0].upper()
     if base in _WINDOWS_RESERVED:
         name = '_' + name
-    # 앞뒤 공백/점 제거 (Windows에서 문제)
     name = name.strip(' .')
     return name or '_unnamed'
 
 
-# ─── 진행률 콜백 타입 ───
+# ─── 콜백 타입 ───
 ProgressCallback = Callable[[int, str], None]
 LogCallback = Callable[[str], None]
 
 
 class FileOrganizer:
-    """파일 정리 엔진 - GUI 독립적 비즈니스 로직
-    [C2] FileEngine 분리 구현
-    [C3] 구체적 에러 핸들링
-    [B5] Logger 세션 단위 통합
-    """
+    """파일 정리 엔진 v2.1"""
 
     def __init__(self, base_path: str,
                  log_callback: Optional[LogCallback] = None,
@@ -137,7 +137,6 @@ class FileOrganizer:
 
         os.makedirs(self.log_dir, exist_ok=True)
 
-        # [B5] 세션 단위 단일 Logger
         log_file = os.path.join(self.log_dir, f'log_{datetime.now():%Y%m%d_%H%M%S}.log')
         self.file_logger = logging.getLogger(f'FileOrganizer_{id(self)}')
         self.file_logger.setLevel(logging.INFO)
@@ -150,6 +149,10 @@ class FileOrganizer:
         self.terms = self._load_terms()
         self.ext_descriptions = self._load_json('ext_descriptions.json')
 
+        # [#3] 검색기록 로드
+        self._history_path = os.path.join(self.log_dir, 'search_history.json')
+        self.search_history = self._load_search_history()
+
     def cancel(self):
         self._cancel = True
 
@@ -157,11 +160,14 @@ class FileOrganizer:
         self._cancel = False
 
     def _log(self, msg: str):
-        self.log_callback(msg)
         self.file_logger.info(msg)
+        self.log_callback(msg)
 
     def _progress(self, pct: int, msg: str = ''):
-        self.progress_callback(min(pct, 100), msg)
+        """[#5] 진행률에 퍼센트 포함"""
+        pct = min(pct, 100)
+        display_msg = f'{msg} ({pct}%)' if msg and pct < 100 else msg
+        self.progress_callback(pct, display_msg)
 
     def _load_json(self, filename: str) -> dict:
         try:
@@ -175,7 +181,6 @@ class FileOrganizer:
             return {}
 
     def _load_terms(self) -> Dict[str, str]:
-        """terms.json 로드 - 배열/딕셔너리/terms키 형식 모두 호환"""
         data = self._load_json('terms.json')
         if not data:
             return {}
@@ -188,7 +193,6 @@ class FileOrganizer:
         return {}
 
     def save_terms(self, terms_dict: Dict[str, str]):
-        """[A2] 쓰기 가능한 경로에 terms.json 저장"""
         path = writable_path('terms.json')
         try:
             with open(path, 'w', encoding='utf-8') as f:
@@ -197,16 +201,79 @@ class FileOrganizer:
         except (PermissionError, OSError) as e:
             self._log(f'[오류] terms.json 저장 실패: {e}')
 
+    # ═══════════════════════════════════════
+    # [#3] 검색기록 저장/로드
+    # ═══════════════════════════════════════
+    def _load_search_history(self) -> list:
+        try:
+            if os.path.exists(self._history_path):
+                with open(self._history_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, OSError):
+            pass
+        return []
+
+    def save_search_history(self, entry: dict):
+        """검색기록 저장 - 최대 50개 유지"""
+        self.search_history.append(entry)
+        if len(self.search_history) > 50:
+            self.search_history = self.search_history[-50:]
+        try:
+            with open(self._history_path, 'w', encoding='utf-8') as f:
+                json.dump(self.search_history, f, ensure_ascii=False, indent=2)
+        except (PermissionError, OSError) as e:
+            self._log(f'[경고] 검색기록 저장 실패: {e}')
+
+    def get_search_history(self) -> list:
+        return self.search_history
+
+    # ═══════════════════════════════════════
+    # 유틸리티
+    # ═══════════════════════════════════════
     def _is_excluded(self, path: str) -> bool:
         rel = os.path.relpath(path, self.base_path)
         top = rel.split(os.sep)[0]
         return top in EXCLUDED_FOLDERS
 
+    def _force_remove_readonly(self, path: str):
+        """[#1] 읽기전용 속성 해제"""
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+
+    def _safe_delete(self, filepath: str, use_trash: bool = False) -> bool:
+        """[#1] 안전한 삭제 - 권한 오류 시 읽기전용 해제 후 재시도"""
+        try:
+            if use_trash:
+                self._send_to_trash(filepath)
+            else:
+                os.remove(filepath)
+            return True
+        except PermissionError:
+            self._force_remove_readonly(filepath)
+            try:
+                os.remove(filepath)
+                return True
+            except PermissionError:
+                self._log(f'  [오류] 권한 부족 (읽기전용 해제 실패): {filepath}')
+                return False
+            except OSError as e:
+                self._log(f'  [오류] 삭제 실패: {filepath}: {e}')
+                return False
+        except FileNotFoundError:
+            self._log(f'  [오류] 파일 없음: {filepath}')
+            return False
+        except OSError as e:
+            self._log(f'  [오류] 삭제 실패: {filepath}: {e}')
+            return False
+
     def _safe_move(self, src: str, dst_dir: str, filename: str = None) -> Optional[str]:
+        """[#6] 이동 실패 시 copy+delete fallback"""
         os.makedirs(dst_dir, exist_ok=True)
         name = filename or os.path.basename(src)
-        # [보안] path traversal 방지 + 금지 문자 제거
-        name = os.path.basename(name)  # ../등 제거
+        name = os.path.basename(name)
         name = _INVALID_FILENAME_CHARS.sub('_', name) if name else '_unnamed'
         base, ext = os.path.splitext(name)
         dst = os.path.join(dst_dir, name)
@@ -218,16 +285,43 @@ class FileOrganizer:
             shutil.move(src, dst)
             return dst
         except PermissionError:
-            self._log(f'[오류] 권한 부족: {src}')
-            return None
+            # [#6] fallback: 복사 후 원본 삭제 시도
+            try:
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+                # 원본 삭제 시도
+                self._force_remove_readonly(src)
+                try:
+                    if os.path.isdir(src):
+                        shutil.rmtree(src, onerror=self._rmtree_onerror)
+                    else:
+                        os.remove(src)
+                except OSError:
+                    self._log(f'  [경고] 복사 완료, 원본 삭제 실패: {src}')
+                return dst
+            except (PermissionError, OSError) as e:
+                self._log(f'  [오류] 이동/복사 모두 실패 (액세스 거부): {src}: {e}')
+                return None
         except FileNotFoundError:
-            self._log(f'[오류] 파일 없음: {src}')
+            self._log(f'  [오류] 파일 없음: {src}')
             return None
         except OSError as e:
-            self._log(f'[오류] 이동 실패: {src} -> {dst}: {e}')
+            self._log(f'  [오류] 이동 실패: {src} -> {dst}: {e}')
             return None
 
+    @staticmethod
+    def _rmtree_onerror(func, path, exc_info):
+        """shutil.rmtree 에러 핸들러 - 읽기전용 해제 후 재시도"""
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            func(path)
+        except OSError:
+            pass
+
     def _collect_files(self) -> List[str]:
+        """대상 파일 수집 (제외 폴더 skip)"""
         files = []
         for root, dirs, filenames in os.walk(self.base_path):
             dirs[:] = [d for d in dirs if not self._is_excluded(os.path.join(root, d))]
@@ -238,15 +332,29 @@ class FileOrganizer:
         return files
 
     def _remove_empty_dirs(self):
-        for root, dirs, files in os.walk(self.base_path, topdown=False):
-            if self._is_excluded(root) or root == self.base_path:
-                continue
-            try:
-                if not os.listdir(root):
-                    os.rmdir(root)
-                    self._log(f'[폴더삭제] {root}')
-            except OSError:
-                pass
+        """[#10] 중복 폴더 제거 - 여러 패스 반복, 시스템 junk 파일 무시"""
+        max_passes = 10
+        for _ in range(max_passes):
+            removed_any = False
+            for root, dirs, files in os.walk(self.base_path, topdown=False):
+                if self._is_excluded(root) or root == self.base_path:
+                    continue
+                try:
+                    entries = os.listdir(root)
+                    real_entries = [e for e in entries if e not in _SYSTEM_JUNK_FILES]
+                    if not real_entries:
+                        for sf in entries:
+                            try:
+                                os.remove(os.path.join(root, sf))
+                            except OSError:
+                                pass
+                        os.rmdir(root)
+                        self._log(f'[폴더삭제] {root}')
+                        removed_any = True
+                except OSError:
+                    pass
+            if not removed_any:
+                break
 
     # ═══════════════════════════════════════
     # 1. 중복파일
@@ -257,6 +365,7 @@ class FileOrganizer:
         files = self._collect_files()
         total = len(files)
         if total == 0:
+            self._progress(100, '파일 없음')
             return {}
 
         # Stage 1: group by size
@@ -271,12 +380,13 @@ class FileOrganizer:
                     size_groups[sz].append(fp)
             except OSError:
                 pass
-            self._progress(int(i / total * 30), f'크기 분석: {i + 1}/{total}')
+            if i % 100 == 0 or i == total - 1:
+                self._progress(int(i / total * 30), f'크기 분석: {i + 1}/{total}')
 
         candidates = {sz: fps for sz, fps in size_groups.items() if len(fps) > 1}
         self._log(f'  크기 중복 그룹: {len(candidates)}개')
 
-        # Stage 2: partial hash [C6] 64KB
+        # Stage 2: partial hash
         self._progress(30, '부분 해시 비교 중...')
         partial_groups = defaultdict(list)
         items = list(candidates.items())
@@ -290,8 +400,9 @@ class FileOrganizer:
                     partial_groups[(sz, h)].append(fp)
                 except OSError:
                     pass
-            self._progress(30 + int(idx / max(len(items), 1) * 30),
-                           f'부분 해시: {idx + 1}/{len(items)}')
+            if idx % 20 == 0 or idx == len(items) - 1:
+                self._progress(30 + int(idx / max(len(items), 1) * 30),
+                               f'부분 해시: {idx + 1}/{len(items)}')
 
         candidates2 = {k: v for k, v in partial_groups.items() if len(v) > 1}
 
@@ -311,48 +422,61 @@ class FileOrganizer:
                     full_groups[sha.hexdigest()].append(fp)
                 except OSError:
                     pass
-            self._progress(60 + int(idx / max(len(items2), 1) * 35),
-                           f'전체 해시: {idx + 1}/{len(items2)}')
+            if idx % 10 == 0 or idx == len(items2) - 1:
+                self._progress(60 + int(idx / max(len(items2), 1) * 35),
+                               f'전체 해시: {idx + 1}/{len(items2)}')
 
         duplicates = {h: fps for h, fps in full_groups.items() if len(fps) > 1}
-        self._log(f'  최종 중복 그룹: {len(duplicates)}개')
+        total_dup_files = sum(len(fps) - 1 for fps in duplicates.values())
+        self._log(f'  최종 중복 그룹: {len(duplicates)}개 (삭제 대상 {total_dup_files}개)')
         self._progress(100, '중복파일 검색 완료')
+
+        # [#3] 검색기록 저장
+        self.save_search_history({
+            'type': 'duplicate_search',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'path': self.base_path,
+            'total_files': total,
+            'duplicate_groups': len(duplicates),
+            'duplicate_files': total_dup_files,
+        })
+
         return duplicates
 
     def delete_duplicates(self, delete_list: List[str], use_trash: bool = False) -> int:
-        """중복파일 삭제 - [F5] 휴지통 옵션 추가"""
+        """[#1] 권한 오류 개선 + [#2] 리스트 복사본 사용"""
         self._log('[중복삭제] 시작...')
-        total = len(delete_list)
+        to_delete = list(delete_list)  # 원본 변경 방지
+        total = len(to_delete)
         if total == 0:
             self._log('[중복삭제] 삭제할 파일 없음')
             return 0
         deleted = 0
-        for i, fp in enumerate(delete_list):
+        errors = 0
+        for i, fp in enumerate(to_delete):
             if self._cancel:
                 return deleted
-            try:
-                if use_trash:
-                    self._send_to_trash(fp)
-                else:
-                    os.remove(fp)
+            if self._safe_delete(fp, use_trash):
                 deleted += 1
                 self._log(f'  삭제: {fp}')
-            except PermissionError:
-                self._log(f'  [오류] 권한 부족: {fp}')
-            except FileNotFoundError:
-                self._log(f'  [오류] 파일 없음: {fp}')
-            except OSError as e:
-                self._log(f'  [오류] {fp}: {e}')
+            else:
+                errors += 1
             self._progress(int((i + 1) / total * 100), f'삭제: {i + 1}/{total}')
-        self._log(f'[중복삭제] {deleted}/{total}개 완료')
+
+        self._log(f'[중복삭제] {deleted}/{total}개 완료' +
+                  (f' ({errors}개 오류)' if errors else ''))
+        self._progress(100, f'중복삭제 완료 ({deleted}/{total})')
         return deleted
 
     def _send_to_trash(self, filepath: str):
-        """[F5] Windows 휴지통으로 이동 (ctypes 활용)"""
+        """Windows 휴지통으로 이동"""
+        if sys.platform != 'win32':
+            os.remove(filepath)
+            return
         try:
             import ctypes
             from ctypes import wintypes
-            # SHFileOperationW를 사용한 휴지통 이동
+
             shell32 = ctypes.windll.shell32
 
             class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -380,18 +504,15 @@ class FileOrganizer:
             if result != 0:
                 raise OSError(f'SHFileOperation 실패: {result}')
         except (ImportError, AttributeError, OSError):
-            # Windows가 아닌 경우 또는 windll 없는 경우 일반 삭제
             os.remove(filepath)
 
     # ═══════════════════════════════════════
     # 2. 차단해제
     # ═══════════════════════════════════════
     def unblock_files(self) -> int:
-        """[C5] 차단해제 - Windows 전용 기능 (다른 OS에서는 건너뜀)"""
         self._log('=' * 50)
         self._log('[2] 차단해제 시작...')
 
-        # Windows 전용 기능
         if sys.platform != 'win32':
             self._log('  [건너뜀] 차단해제는 Windows 전용 기능입니다.')
             self._progress(100, '차단해제: Windows 전용')
@@ -399,6 +520,9 @@ class FileOrganizer:
 
         files = self._collect_files()
         total = len(files)
+        if total == 0:
+            self._progress(100, '차단해제: 파일 없음')
+            return 0
         unblocked = 0
 
         for i, fp in enumerate(files):
@@ -408,12 +532,11 @@ class FileOrganizer:
                 zone = fp + ':Zone.Identifier'
                 if os.path.exists(zone):
                     try:
-                        # [보안] command injection 방지: 리스트 형태로 인자 전달
                         subprocess.run(
                             ['powershell', '-NoProfile', '-Command',
                              'Unblock-File', '-LiteralPath', fp],
                             capture_output=True, timeout=10,
-                            creationflags=0x08000000  # CREATE_NO_WINDOW (Windows 전용, 위에서 플랫폼 체크됨)
+                            creationflags=0x08000000
                         )
                         unblocked += 1
                         self._log(f'  차단해제: {fp}')
@@ -426,28 +549,26 @@ class FileOrganizer:
                             pass
             except OSError:
                 pass
-            self._progress(int((i + 1) / total * 100) if total else 100,
-                           f'차단해제: {i + 1}/{total}')
+            if i % 50 == 0 or i == total - 1:
+                self._progress(int((i + 1) / total * 100),
+                               f'차단해제: {i + 1}/{total}')
 
         self._log(f'[차단해제] {unblocked}개 완료')
         self._progress(100, '차단해제 완료')
         return unblocked
 
     # ═══════════════════════════════════════
-    # 3. Util / 프로젝트 분류 (개선안 #2)
+    # 3. Util / 프로젝트 분류
     # ═══════════════════════════════════════
     def _is_code_project(self, dirpath: str, max_depth: int = 2) -> bool:
-        """프로젝트 감지 - 재귀 탐색 깊이 제한 (피드백 #2 반영)"""
         try:
             entries = set(os.listdir(dirpath))
         except OSError:
             return False
 
-        # 직하위에서 마커 발견
         if entries & PROJECT_MARKERS:
             return True
 
-        # 하위 디렉토리도 탐색 (max_depth 제한)
         if max_depth > 0:
             for entry in entries:
                 subpath = os.path.join(dirpath, entry)
@@ -459,7 +580,6 @@ class FileOrganizer:
                     except OSError:
                         pass
 
-        # 코드 파일 비율로 판단 (웹 콘텐츠도 포함하여 프로젝트 감지)
         code_count = sum(1 for e in entries
                          if os.path.isfile(os.path.join(dirpath, e))
                          and os.path.splitext(e)[1].lower() in PROJECT_CODE_EXTENSIONS)
@@ -467,7 +587,7 @@ class FileOrganizer:
         return total_count > 0 and code_count / total_count >= 0.5
 
     def classify_util(self) -> Tuple[int, int, int]:
-        """Util 분류: 실행파일 + 프로젝트(구조유지) + 개별소스코드"""
+        """[#6] Util 분류 - 이동실패 시 copy+delete fallback 적용"""
         self._log('=' * 50)
         self._log('[3] Util/프로젝트 분류 시작...')
         util_base = os.path.join(self.base_path, 'Util')
@@ -475,7 +595,7 @@ class FileOrganizer:
         project_count = 0
         source_count = 0
 
-        # ── 프로젝트 디렉토리 감지 (개선안 #2) ──
+        # 프로젝트 디렉토리 감지
         project_dirs = []
         for root, dirs, _ in os.walk(self.base_path):
             dirs[:] = [d for d in dirs if not self._is_excluded(os.path.join(root, d))]
@@ -501,10 +621,18 @@ class FileOrganizer:
                     shutil.move(pdir, dst)
                     project_count += 1
                     self._log(f'  [프로젝트] {pdir} -> {dst}')
-                except (PermissionError, OSError) as e:
+                except PermissionError:
+                    try:
+                        shutil.copytree(pdir, dst)
+                        shutil.rmtree(pdir, onerror=self._rmtree_onerror)
+                        project_count += 1
+                        self._log(f'  [프로젝트] {pdir} -> {dst} (복사방식)')
+                    except (PermissionError, OSError) as e:
+                        self._log(f'  [오류] 프로젝트 이동 실패 (액세스 거부): {pdir}: {e}')
+                except OSError as e:
                     self._log(f'  [오류] 프로젝트 이동 실패: {pdir}: {e}')
 
-        # ── 실행파일 + 개별 소스코드 분류 ──
+        # 실행파일 + 개별 소스코드 분류
         files = self._collect_files()
         total = len(files)
         for i, fp in enumerate(files):
@@ -519,7 +647,6 @@ class FileOrganizer:
                     moved_count += 1
                     self._log(f'  [Util] {fp} -> {result}')
             elif ext in CODE_EXTENSIONS and ext not in UTIL_EXTENSIONS:
-                # 개별 소스 코드 파일 → Util/Source/{EXT}/
                 ext_name = ext.lstrip('.').upper()
                 dst_dir = os.path.join(util_base, 'Source', ext_name)
                 result = self._safe_move(fp, dst_dir)
@@ -527,51 +654,47 @@ class FileOrganizer:
                     source_count += 1
                     self._log(f'  [소스] {fp} -> {result}')
 
-            self._progress(int((i + 1) / total * 100) if total else 100,
-                           f'Util: {i + 1}/{total}')
+            if i % 50 == 0 or i == total - 1:
+                self._progress(int((i + 1) / total * 100) if total else 100,
+                               f'Util: {i + 1}/{total}')
 
         self._log(f'[Util] 실행파일 {moved_count}개, 프로젝트 {project_count}개, 소스 {source_count}개 완료')
         self._progress(100, 'Util 분류 완료')
+
+        self.save_search_history({
+            'type': 'util_classify',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'path': self.base_path,
+            'util_files': moved_count,
+            'projects': project_count,
+            'source_files': source_count,
+        })
+
         return moved_count, project_count, source_count
 
     # ═══════════════════════════════════════
-    # 4. 확장자별 분류 (개선안 #3)
+    # 4. 확장자별 분류
     # ═══════════════════════════════════════
-    # 의미 없는 접두사 (주제로 부적합)
     _NOISE_PREFIXES = {'img', 'dsc', 'vid', 'mov', 'rec', 'screenshot', 'screen',
                         'capture', 'photo', 'pic', 'file', 'new', 'copy', 'temp',
                         'tmp', 'untitled', 'download',
-                        # 전치사/관사 (2글자 이상이라 토큰으로 잡힘)
                         'of', 'the', 'for', 'and', 'to', 'in', 'on', 'at', 'by'}
 
     def _extract_topic(self, filename: str) -> Optional[str]:
-        """주제 키워드 추출 (개선안 #3 + 피드백 #3 camelCase 처리)"""
         name = os.path.splitext(filename)[0]
-
-        # dotfile은 주제 추출 불가
         if not name or name.startswith('.'):
             return None
-
-        # 번호, 날짜 패턴 제거
         name = re.sub(r'\(\d+\)$', '', name)
         name = re.sub(r'[_\-]?\d{8}', '', name)
         name = re.sub(r'^\d{4}년?\s*', '', name)
-
-        # [피드백 #3] camelCase / PascalCase 분리
         name = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', name)
         name = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', name)
-
-        # 공백, 언더스코어, 하이픈, 점으로 분리 [C4, F6]
         tokens = re.split(r'[\s_\-\.]+', name.strip())
-
-        # 첫 번째 의미 있는 토큰
         for token in tokens:
             token = token.strip()
             if len(token) >= 2 and not token.isdigit():
-                # [문제 1] 의미없는 접두사 필터
                 if token.lower() in self._NOISE_PREFIXES:
                     continue
-                # [피드백 #4] 용어 사전으로 정규화 (한영 통합)
                 normalized = token.lower()
                 if normalized in self.terms:
                     result = self.terms[normalized]
@@ -579,13 +702,11 @@ class FileOrganizer:
                     result = token.capitalize()
                 else:
                     result = token
-                # [보안] 폴더명으로 사용되므로 금지 문자 제거
                 result = sanitize_name(result)
                 return result if result and result != '_unnamed' else None
         return None
 
     def _create_ext_description(self, ext_folder: str, ext_lower: str):
-        """확장자 설명 txt 생성 (개선안 #3-A)"""
         desc_file = os.path.join(ext_folder, f'{ext_lower}.txt')
         if os.path.exists(desc_file):
             return
@@ -607,22 +728,27 @@ class FileOrganizer:
             pass
 
     def classify_by_extension(self) -> int:
-        """확장자별 분류 + 주제 하위폴더 (개선안 #3-B)"""
+        """[#7] 확장자별 분류 - 권한 오류 시 fallback 적용"""
         self._log('=' * 50)
         self._log('[4] 확장자별 분류 시작...')
         files = self._collect_files()
         total = len(files)
+        if total == 0:
+            self._log('[확장자 분류] 분류할 파일 없음')
+            self._progress(100, '확장자별 분류: 파일 없음')
+            return 0
         moved = 0
+        errors = 0
         etc_dir = os.path.join(self.base_path, '기타')
 
-        # 코드 파일은 이미 Util에서 처리되므로 건너뜀
         for i, fp in enumerate(files):
             if self._cancel:
                 return moved
             ext = os.path.splitext(fp)[1].lower()
             if ext in UTIL_EXTENSIONS or ext in CODE_EXTENSIONS:
-                self._progress(int((i + 1) / total * 100) if total else 100,
-                               f'분류: {i + 1}/{total}')
+                if i % 50 == 0 or i == total - 1:
+                    self._progress(int((i + 1) / total * 100),
+                                   f'분류: {i + 1}/{total}')
                 continue
 
             filename = os.path.basename(fp)
@@ -631,6 +757,8 @@ class FileOrganizer:
                 if result:
                     moved += 1
                     self._log(f'  [기타] {fp} -> {result}')
+                else:
+                    errors += 1
             else:
                 ext_name = ext.lstrip('.').upper()
                 ext_lower = ext.lstrip('.').lower()
@@ -638,7 +766,6 @@ class FileOrganizer:
                 os.makedirs(ext_folder, exist_ok=True)
                 self._create_ext_description(ext_folder, ext_lower)
 
-                # 주제별 하위 분류 (동영상, 문서)
                 if ext in VIDEO_EXTENSIONS or ext in DOCUMENT_EXTENSIONS:
                     topic = self._extract_topic(filename)
                     dst_dir = os.path.join(ext_folder, topic) if topic else ext_folder
@@ -649,41 +776,48 @@ class FileOrganizer:
                 if result:
                     moved += 1
                     self._log(f'  [{ext_name}] {fp} -> {result}')
+                else:
+                    errors += 1
 
-            self._progress(int((i + 1) / total * 100) if total else 100,
-                           f'분류: {i + 1}/{total}')
+            if i % 50 == 0 or i == total - 1:
+                self._progress(int((i + 1) / total * 100),
+                               f'분류: {i + 1}/{total}')
 
-        self._log(f'[확장자 분류] {moved}개 완료')
+        self._log(f'[확장자 분류] {moved}개 완료' +
+                  (f' ({errors}개 오류)' if errors else ''))
         self._progress(100, '확장자별 분류 완료')
+
+        self.save_search_history({
+            'type': 'ext_classify',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'path': self.base_path,
+            'moved_files': moved,
+            'errors': errors,
+        })
+
         return moved
 
     # ═══════════════════════════════════════
-    # 5. 파일명 변환 [A1 버그 수정]
+    # 5. 파일명 변환
     # ═══════════════════════════════════════
     def _is_cjk(self, text: str) -> bool:
-        """[B1] has_cjk_chars와 통합 (is_cjk_filename 삭제)"""
         for ch in text:
             if '\u3400' <= ch <= '\u9fff' or '\uac00' <= ch <= '\ud7a3':
                 return True
         return False
 
     def _convert_filename(self, name: str) -> str:
-        """[A1] 복합어 부분 매칭 버그 수정 + [C4] 분리 기준 확장
-        [피드백 #1] 긴 용어 우선 매칭"""
+        """[#9] 파일명 변환 개선 - CJK 혼합 처리, 빈 결과 방지"""
         base, ext = os.path.splitext(name)
         ext = ext.lower()
 
-        # dotfile(.gitignore 등)은 변환하지 않음
         if base.startswith('.') or not base:
             return name
 
         if self._is_cjk(base):
             return base + ext
 
-        # [C4] 공백 + 언더스코어 + 하이픈으로 분리 (구분자 보존)
         parts = re.split(r'([\s_\-\.]+)', base)
-
-        # [피드백 #1] 긴 용어부터 매칭하도록 정렬
         sorted_terms = sorted(self.terms.items(), key=lambda x: len(x[0]), reverse=True)
 
         new_parts = []
@@ -691,8 +825,6 @@ class FileOrganizer:
             if re.match(r'^[\s_\-\.]+$', part):
                 new_parts.append(part)
                 continue
-
-            # 빈 문자열 건너뜀
             if not part:
                 continue
 
@@ -703,9 +835,7 @@ class FileOrganizer:
                 new_parts.append(self.terms[lower])
                 continue
 
-            # 2) [A1] 복합어 내 부분 매칭 (긴 용어 우선)
-            #    부분매칭은 3글자 이상 용어만 (2글자 it/ai/os 등이 단어 내부에서 오매칭 방지)
-            found = False
+            # 2) 복합어 내 부분 매칭 (3글자 이상 용어만)
             remaining = part
             result_pieces = []
             while remaining:
@@ -719,20 +849,24 @@ class FileOrganizer:
                         result_pieces.append(term_original)
                         remaining = remaining[idx + len(term_lower):]
                         matched = True
-                        found = True
                         break
                 if not matched:
-                    result_pieces.append(remaining.capitalize())
+                    if remaining:
+                        result_pieces.append(remaining.capitalize())
                     break
 
-            if found:
+            if result_pieces:
                 new_parts.append(''.join(result_pieces))
             else:
                 new_parts.append(part.capitalize())
 
-        # [보안] 변환 결과에서 금지 문자 제거
         new_base = ''.join(new_parts)
         new_base = _INVALID_FILENAME_CHARS.sub('_', new_base)
+
+        # 변환 결과가 비면 원본 유지
+        if not new_base or not new_base.strip('_. '):
+            return name
+
         return new_base + ext
 
     def preview_renames(self) -> List[Tuple[str, str, str]]:
@@ -741,7 +875,6 @@ class FileOrganizer:
         renames = []
         files_list = []
         for root, dirs, filenames in os.walk(self.base_path):
-            # [문제 6] excluded 폴더 내 파일은 변환 대상에서 제외
             dirs[:] = [d for d in dirs if not self._is_excluded(os.path.join(root, d))]
             for fn in filenames:
                 fp = os.path.join(root, fn)
@@ -756,8 +889,9 @@ class FileOrganizer:
             new_name = self._convert_filename(fn)
             if new_name != fn:
                 renames.append((fp, fn, new_name))
-            self._progress(int((i + 1) / total * 100) if total else 100,
-                           f'미리보기: {i + 1}/{total}')
+            if i % 100 == 0 or i == total - 1:
+                self._progress(int((i + 1) / total * 100) if total else 100,
+                               f'미리보기: {i + 1}/{total}')
 
         self._log(f'  변환 대상: {len(renames)}개')
         return renames
@@ -765,6 +899,9 @@ class FileOrganizer:
     def apply_renames(self, renames: List[Tuple[str, str, str]]) -> int:
         self._log('[파일명 변환] 시작...')
         total = len(renames)
+        if total == 0:
+            self._progress(100, '변환할 파일 없음')
+            return 0
         applied = 0
         for i, (fp, old_name, new_name) in enumerate(renames):
             if self._cancel:
@@ -773,8 +910,6 @@ class FileOrganizer:
             new_path = os.path.join(dirpath, new_name)
             base_n, ext_n = os.path.splitext(new_name)
             c = 2
-            # [보안] 대소문자 무시 파일시스템(Windows/macOS) 대응
-            # normcase로 비교하여 무한루프 방지
             while os.path.exists(new_path) and os.path.normcase(new_path) != os.path.normcase(fp):
                 new_path = os.path.join(dirpath, f'{base_n}({c}){ext_n}')
                 c += 1
@@ -788,8 +923,9 @@ class FileOrganizer:
                 self._log(f'  [오류] 파일 없음: {old_name}')
             except OSError as e:
                 self._log(f'  [오류] {old_name}: {e}')
-            self._progress(int((i + 1) / total * 100) if total else 100,
-                           f'변환: {i + 1}/{total}')
+            if i % 50 == 0 or i == total - 1:
+                self._progress(int((i + 1) / total * 100),
+                               f'변환: {i + 1}/{total}')
 
         self._log(f'[파일명 변환] {applied}개 완료')
         self._progress(100, '파일명 변환 완료')
@@ -812,8 +948,9 @@ class FileOrganizer:
             result = self._safe_move(fp, self.base_path)
             if result:
                 moved += 1
-            self._progress(int((i + 1) / total * 100) if total else 100,
-                           f'꺼내기: {i + 1}/{total}')
+            if i % 50 == 0 or i == total - 1:
+                self._progress(int((i + 1) / total * 100) if total else 100,
+                               f'꺼내기: {i + 1}/{total}')
         self._remove_empty_dirs()
         self._log(f'[사전작업] {moved}개 이동 완료')
         self._progress(100, '파일 꺼내기 완료')

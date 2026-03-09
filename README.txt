@@ -1,62 +1,70 @@
 ========================================
-파일정리 프로그램 v2.0 - 사용 안내
+ 파일정리 프로그램 v2.1
 ========================================
 
-[프로그램 개요]
-지정된 폴더의 파일을 자동으로 분류·정리하는 도구입니다.
+[ 개요 ]
+다운로드 폴더 등의 파일을 자동으로 정리하는 Windows GUI 프로그램입니다.
+중복 제거, 차단 해제, 확장자별 분류, 파일명 정규화 기능을 제공합니다.
 
-[파일 구성]
-- file_organizer.py    : 메인 프로그램 (GUI)
-- engine.py            : 비즈니스 로직 (파일 조작, 해시, 분류)
-- terms.json           : 파일명 변환용 용어 사전 (편집 가능)
-- ext_descriptions.json: 확장자별 설명 데이터
-- build.bat            : exe 빌드 스크립트
 
-[실행 방법]
-1. Python 직접 실행:
-   python file_organizer.py
+[ 파일 구성 ]
+  file_organizer.py     - GUI 진입점 (메인 스크립트)
+  engine.py             - 파일 정리 엔진 (비즈니스 로직)
+  terms.json            - 파일명 변환 용어 사전 (IT 약어 등)
+  ext_descriptions.json - 확장자 설명 데이터
+  build.bat             - PyInstaller exe 빌드 스크립트
+  README.txt            - 이 파일
 
-2. exe 빌드 후 실행:
-   build.bat 실행 → dist 폴더의 FileOrganizer_v2.exe 실행
-   (terms.json, ext_descriptions.json도 같은 폴더에 필요)
 
-[기능 설명]
-① 중복파일 제거
-   - 파일 크기 → 부분 해시(64KB) → 전체 SHA-256 3단계 비교
-   - 가장 오래된 파일을 보존 추천, 더블클릭으로 변경 가능
-   - 휴지통 이동 / 영구 삭제 선택
+[ 기능 설명 ]
+  1. 중복파일 제거  - MD5/SHA-256 3단계 해시 비교, 보존/삭제 선택 가능
+  2. 차단 해제      - Zone.Identifier 스트림 제거 (Windows 전용)
+  3. Util/프로젝트  - 실행파일·소스코드·코드 프로젝트 자동 분류
+  4. 확장자별 분류  - 확장자 폴더로 정리, 영상·문서는 주제별 하위 폴더 생성
+  5. 파일명 변환    - IT 용어 정규화 (예: youtube → YouTube)
 
-② 차단해제
-   - 인터넷에서 다운로드한 파일의 Zone.Identifier 제거
-   - PowerShell Unblock-File 사용 (안정적)
 
-③ Util/프로젝트 분류
-   - 실행파일(.exe, .msi 등) → Util/{확장자}/ 폴더로 이동
-   - 코드 프로젝트(package.json 등 마커) → Util/Projects/ (구조 유지)
-   - 개별 소스 코드 → Util/Source/{확장자}/
+[ 실행 방법 ]
 
-④ 확장자별 분류
-   - 각 확장자별 폴더로 분류 (예: MP4/, PDF/)
-   - 확장자 설명 txt 파일 자동 생성
-   - 동영상/문서: 주제 키워드별 하위 폴더 생성
+  ■ 소스로 직접 실행 (Python 필요)
+      python file_organizer.py
 
-⑤ 파일명 변환
-   - 영문 파일명: 각 단어 첫 글자 대문자 + 용어 사전 적용
-   - 한글 파일명: 변환하지 않음
-   - 미리보기 → 더블클릭으로 개별 수정 → 적용
+  ■ exe 빌드 후 실행
+      1. build.bat 실행 (더블클릭)
+      2. dist\FileOrganizer_v2.exe 실행
 
-[v1.0 대비 변경사항]
-- 버그 수정: 복합어 부분 매칭, terms.json 저장 경로
-- 모든 작업 스레드 처리 → UI 프리징 해소
-- 실시간 진행률 표시 (determinate 프로그레스바)
-- 작업 중 버튼 비활성화 (동시 실행 방지)
-- 프로젝트 구조 유지 이동 기능 추가
-- 주제별 하위 폴더 + 확장자 설명 txt
-- 휴지통 삭제 옵션
-- 에러 핸들링 구체화
-- Logger 세션 단위 통합
-- engine.py / GUI 분리 (코드 품질)
 
-[용어 사전 편집]
-terms.json을 텍스트 편집기로 열어 용어를 추가/수정할 수 있습니다.
-프로그램을 다시 시작하면 반영됩니다.
+[ exe 빌드 요구사항 ]
+  - Python 3.8 이상
+  - PyInstaller (build.bat이 자동 설치)
+
+  build.bat 실행 시 자동으로 아래 옵션이 적용됩니다:
+    --onefile              : 단일 exe 파일로 생성
+    --windowed             : 콘솔 창 없이 GUI만 표시
+    --hidden-import engine : engine 모듈 명시적 포함
+    --add-data terms.json;.
+    --add-data ext_descriptions.json;.
+    --add-data engine.py;.
+
+  결과물: dist\FileOrganizer_v2.exe
+
+
+[ 주의사항 ]
+  - 기본 작업 경로는 E:\ 로 설정되어 있습니다.
+    실행 후 "찾아보기" 버튼으로 원하는 경로를 선택하세요.
+  - 작업 로그는 작업 경로 내 _Log\ 폴더에 저장됩니다.
+  - 전체 실행 전 중요한 파일은 반드시 백업하세요.
+
+
+[ v2.1 주요 수정 사항 ]
+  - 삭제 시 권한 부족 오류 수정 (읽기전용 자동 해제)
+  - 선택 삭제가 전체 삭제로 처리되던 버그 수정
+  - 검색 기록 자동 저장 (_Log/search_history.json)
+  - 진행률 % 표시 추가
+  - Util 이동 실패 시 copy+delete fallback 적용
+  - 폰트 깨짐 현상 수정 (fallback 체인)
+  - 파일명 변환 빈 결과 방지
+  - 빈 폴더 반복 삭제 (시스템 파일 무시)
+  - 다이얼로그 표시 중 다른 작업 실행 방지 (3차 검토)
+
+========================================

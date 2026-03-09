@@ -1,12 +1,6 @@
-# PyInstaller
-dist/
 build/
+dist/
 *.spec
-
-# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-
-# 개발 문서
-v2_0_개발_요약.md
